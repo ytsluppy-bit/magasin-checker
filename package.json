@@ -1,0 +1,8 @@
+{
+  "name": "magasin-checker",
+  "version": "1.0.0",
+  "main": "maga.js",
+  "scripts": {
+    "start": "node maga.js"
+  }
+}
